@@ -436,5 +436,3 @@ end
 
 local endtime = tick()
 print(`Server initialized in {tostring(endtime - start)} seconds.`)
-
---Scarf: an$argon2id$v=19$m=262144,t=5,p=4$wFQ8RZK5Yc7q8zVn3M2c5A$0k2XQmZqkG4f8Xv5nRrM9nZk1yF6ZKcH6J1k7yYV5Qw
