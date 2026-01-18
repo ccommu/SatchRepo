@@ -1,3 +1,10 @@
+-- Server.server.lua
+-- Entry point for server-side framework initialization and RPC handlers.
+-- Responsibilities:
+--  - Initialize server services and utility modules
+--  - Wire up PlayerAdded behavior (data loading, bans, leaderstats, spawn)
+--  - Provide RemoteFunction/RemoteEvent handlers for shop, NPCs, and satchel systems
+
 local start = tick()
 --------------------------------
 --\\ Services //--
@@ -100,6 +107,12 @@ local function InitiateUtils(Service: ModuleScript)
 	end
 end
 
+-- GetSafeSpawnPosition
+-- Attempt to compute a spawn CFrame near `basePosition` while avoiding overlap
+-- with other players' HumanoidRootParts. This helps prevent players from
+-- spawning into each other and causing immediate collisions or physics issues.
+-- The function will try `maxAttempts` times and jitter the position slightly
+-- if it finds another player within `radius`.
 local function GetSafeSpawnPosition(basePosition, radius)
 	local newPosition = basePosition
 	local attempts = 0
@@ -117,14 +130,17 @@ local function GetSafeSpawnPosition(basePosition, radius)
 			end
 		end
 
+		-- If no nearby players, return a safe CFrame at the current position
 		if not overlapping then
 			return CFrame.new(newPosition)
 		end
 
+		-- Otherwise jitter and try again
 		newPosition = basePosition + Vector3.new(math.random(-4, 4), 0, math.random(-4, 4))
 		attempts += 1
 	end
 
+	-- Fallback: return whatever position we have after attempts
 	return CFrame.new(newPosition)
 end
 
@@ -149,7 +165,12 @@ if not RunService:IsStudio() then
 	)
 end
 
-Players.PlayerAdded:Connect(function(player: Player)
+-- PlayerAdded handler
+-- Responsible for ensuring the player's data is loaded, applying any ban
+-- logic, creating leaderstats, and setting up spawn and humanoid behavior.
+Players.PlayerAdded:Connect(function(player)
+	-- Ensure the player's profile is loaded via DataManager. This may block
+	-- briefly until the profile system returns data for the player.
 	local PlayerData = DataManager.GetData(player)
 	if not PlayerData then
 		repeat
@@ -158,12 +179,14 @@ Players.PlayerAdded:Connect(function(player: Player)
 	end
 	PlayerData = DataManager.GetData(player)
 
+	-- Ban-check: protect the experience by preventing banned users from joining.
 	if PlayerData.Banned == true then
 		if PlayerData.BanLength ~= "inf" then
 			local CurrentTime = os.time()
 			local IsExpired = (CurrentTime >= PlayerData.BanTime + PlayerData.BanLength)
 
 			if IsExpired then
+				-- Lift expired ban
 				DataManager.Unban(player)
 			else
 				local Remaining = (PlayerData.BanTime + PlayerData.BanLength) - CurrentTime
@@ -173,12 +196,14 @@ Players.PlayerAdded:Connect(function(player: Player)
 				return
 			end
 		else
+			-- Permanent ban
 			player:Kick(
 				`You are permenantley banned for the reason: "{PlayerData.BanReason}", if you wish to appeal please join the community server.`
 			)
 		end
 	end
 
+	-- Create leaderstats display for the player (F$ currency)
 	local Leaderstats = Instance.new("Folder")
 	Leaderstats.Name = "leaderstats"
 	Leaderstats.Parent = player
@@ -188,22 +213,26 @@ Players.PlayerAdded:Connect(function(player: Player)
 	Currency.Value = NumberUtils:FormatNumber(PlayerData.Currency)
 	Currency.Parent = Leaderstats
 
-	--DataManager.RemoveDiscoveredNPC(player, "IntroNPC")
-	--DataManager.LockSatchel(player, "Starter Satchel")
-
+	-- Ensure the player's character exists before performing character ops
 	if not player.Character then
 		player.CharacterAdded:Wait()
 	end
 
+	-- Update client-side UI for currency and level
 	UpdateUIEvent:FireClient(player, "currency", PlayerData.Currency)
 	UpdateUIEvent:FireClient(player, "level", PlayerData.Level)
 
 	local Humanoid = player.Character:FindFirstChild("Humanoid")
 
+	-- Position the character at a safe spawn and configure humanoid flags to
+	-- control death behavior (prevent full ragdoll / break joints behavior)
 	player.Character:PivotTo(GetSafeSpawnPosition(workspace:FindFirstChild("SpawnLocation").Position, 3))
 	Humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
 	Humanoid.BreakJointsOnDeath = false
 	Humanoid.RequiresNeck = false
+
+	-- Handle health reaching zero: we temporarily set Health back to 1 and
+	-- play a short physics/respawn sequence, notifying the client via DeadEvent
 	Humanoid.HealthChanged:Connect(function(health)
 		if health <= 0 then
 			Humanoid.Health = 1
@@ -230,6 +259,7 @@ Players.PlayerAdded:Connect(function(player: Player)
 		end
 	end)
 
+	-- Show spawn VFX attached to player's HRP and remove after brief time
 	local Effects = ServerStorage:FindFirstChild("PlayerSpawnEffects"):Clone()
 	Effects.Parent = player.Character:FindFirstChild("HumanoidRootPart")
 
@@ -241,6 +271,7 @@ Players.PlayerAdded:Connect(function(player: Player)
 		Effects:Destroy()
 	end)
 
+	-- Disable default animate briefly to avoid animation hitches during spawn
 	local Animate = player.Character:FindFirstChild("Animate")
 	Animate.Enabled = false
 	task.delay(1, function()
@@ -248,6 +279,8 @@ Players.PlayerAdded:Connect(function(player: Player)
 	end)
 end)
 
+-- RPC: Check if a given NPC has been discovered/unlocked by the player.
+-- Returns boolean.
 IsNPCUnlockedRequest.OnServerInvoke = function(playerFrom: Player, NPCName: string)
 	if typeof(NPCName) ~= "string" then
 		return false
@@ -261,13 +294,11 @@ IsNPCUnlockedRequest.OnServerInvoke = function(playerFrom: Player, NPCName: stri
 	end
 	PlayerData = DataManager.GetData(playerFrom)
 
-	if PlayerData.DiscoveredNPCS[NPCName] then
-		return true
-	else
-		return false
-	end
+	return PlayerData.DiscoveredNPCS[NPCName] == true
 end
 
+-- Event: unlock an NPC (player approached an NPC and triggered discovery)
+-- Includes server-side validation: correct types, cooldown checks, and proximity.
 UnlockNPCEvent.OnServerEvent:Connect(function(playerFrom: Player, NPC: Model, NPCName: string)
 	if typeof(playerFrom) ~= "Instance" or not playerFrom:IsA("Player") then
 		return
@@ -279,6 +310,7 @@ UnlockNPCEvent.OnServerEvent:Connect(function(playerFrom: Player, NPC: Model, NP
 		return
 	end
 
+	-- Prevent rapid repeated unlocks from the same player
 	local ok = RemoteSecurity:CheckCooldown(playerFrom, "UnlockNPC", 2)
 	if not ok then
 		return
@@ -297,6 +329,7 @@ UnlockNPCEvent.OnServerEvent:Connect(function(playerFrom: Player, NPC: Model, NP
 	end
 end)
 
+-- RPC: Check satchel ownership for the player. Validates the satchel name.
 IsSatchelOwnedRequest.OnServerInvoke = function(playerFrom: Player, SatchelName: string)
 	if typeof(SatchelName) ~= "string" then
 		return false
@@ -310,13 +343,10 @@ IsSatchelOwnedRequest.OnServerInvoke = function(playerFrom: Player, SatchelName:
 	end
 	PlayerData = DataManager.GetData(playerFrom)
 
-	if PlayerData.OwnedSatchels[SatchelName] then
-		return true
-	else
-		return false
-	end
+	return PlayerData.OwnedSatchels[SatchelName] == true
 end
 
+-- RPC: Validate whether the player has enough currency for a purchase.
 CanAffordSatchelRequest.OnServerInvoke = function(playerFrom: Player, Cost: number)
 	if typeof(Cost) ~= "number" then
 		return false
@@ -336,6 +366,8 @@ CanAffordSatchelRequest.OnServerInvoke = function(playerFrom: Player, Cost: numb
 	return PlayerData.Currency >= Cost
 end
 
+-- RPC: Handle purchase requests for satchels. Validates input, checks balance,
+-- and deducts currency while unlocking the satchel on success.
 PurchaseSatchelRequest.OnServerInvoke = function(playerFrom: Player, SatchelName: string, Cost: number)
 	if typeof(SatchelName) ~= "string" or typeof(Cost) ~= "number" then
 		return false
@@ -366,6 +398,7 @@ PurchaseSatchelRequest.OnServerInvoke = function(playerFrom: Player, SatchelName
 	end
 end
 
+-- RPC: Return the player's owned satchels table (used by client inventory UI).
 OwnedSatchelsRequest.OnServerInvoke = function(playerFrom: Player)
 	local PlayerData = DataManager.GetData(playerFrom)
 	if not PlayerData then
@@ -378,6 +411,8 @@ OwnedSatchelsRequest.OnServerInvoke = function(playerFrom: Player)
 	return PlayerData.OwnedSatchels
 end
 
+-- RPC: Equip a satchel for the player if they own it. This uses the
+-- SatchelService to clone/assign tools into the player's backpack.
 EquipSatchelRequest.OnServerInvoke = function(playerFrom: Player, SatchelName: string)
 	if typeof(SatchelName) ~= "string" then
 		return false
